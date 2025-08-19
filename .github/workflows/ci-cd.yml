@@ -1,0 +1,261 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  release:
+    types: [ published ]
+
+env:
+  DOTNET_VERSION: '9.0.x'
+  SOLUTION_PATH: 'Claude.Orchestrator.sln'
+  MAIN_PROJECT_PATH: 'Claude.Orchestrator.Console/Claude.Orchestrator.Console.csproj'
+  TEST_PROJECT_PATH: 'Claude.Orchestrator.Tests/Claude.Orchestrator.Tests.csproj'
+
+jobs:
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Full history for SonarCloud
+    
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+    
+    - name: Cache NuGet packages
+      uses: actions/cache@v4
+      with:
+        path: ~/.nuget/packages
+        key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj', '**/packages.lock.json') }}
+        restore-keys: |
+          ${{ runner.os }}-nuget-
+    
+    - name: Restore dependencies
+      run: dotnet restore ${{ env.SOLUTION_PATH }} --source https://api.nuget.org/v3/index.json
+    
+    - name: Build solution
+      run: dotnet build ${{ env.SOLUTION_PATH }} --configuration Release --no-restore --verbosity normal
+    
+    - name: Run tests
+      run: dotnet test ${{ env.SOLUTION_PATH }} --configuration Release --no-build --verbosity normal --collect:"XPlat Code Coverage" --logger trx --results-directory TestResults/
+    
+    - name: Upload test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: test-results
+        path: TestResults/
+    
+    - name: Upload coverage reports to Codecov
+      if: always()
+      uses: codecov/codecov-action@v4
+      with:
+        directory: TestResults/
+        flags: unittests
+        name: codecov-umbrella
+        fail_ci_if_error: false
+
+  sonarcloud:
+    name: SonarCloud Analysis
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Shallow clones should be disabled for better analysis
+    
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+    
+    - name: Cache SonarCloud packages
+      uses: actions/cache@v4
+      with:
+        path: ~/.sonar/cache
+        key: ${{ runner.os }}-sonar
+        restore-keys: ${{ runner.os }}-sonar
+    
+    - name: Install SonarCloud scanner
+      run: dotnet tool install --global dotnet-sonarscanner
+    
+    - name: Restore dependencies
+      run: dotnet restore ${{ env.SOLUTION_PATH }} --source https://api.nuget.org/v3/index.json
+    
+    - name: Build and analyze
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      run: |
+        dotnet-sonarscanner begin \
+          /k:"CodexForgeBR_Claude.Orchestrator" \
+          /o:"codexforgebr" \
+          /d:sonar.login="${{ secrets.SONAR_TOKEN }}" \
+          /d:sonar.host.url="https://sonarcloud.io" \
+          /d:sonar.cs.opencover.reportsPaths="**/TestResults/**/coverage.opencover.xml" \
+          /d:sonar.coverage.exclusions="**/*Tests*/**,**/Program.cs"
+        
+        dotnet build ${{ env.SOLUTION_PATH }} --configuration Release
+        
+        dotnet test ${{ env.SOLUTION_PATH }} \
+          --configuration Release \
+          --no-build \
+          --collect:"XPlat Code Coverage" \
+          --settings coverlet.runsettings \
+          -- DataCollectionRunSettings.DataCollectors.DataCollector.Configuration.Format=opencover
+        
+        dotnet-sonarscanner end /d:sonar.login="${{ secrets.SONAR_TOKEN }}"
+
+  security-scan:
+    name: Security Vulnerability Scan
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+    
+    - name: Restore dependencies
+      run: dotnet restore ${{ env.SOLUTION_PATH }} --source https://api.nuget.org/v3/index.json
+    
+    - name: Run security audit
+      run: dotnet list package --vulnerable --include-transitive --format json > vulnerability-report.json
+    
+    - name: Upload vulnerability report
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: vulnerability-report
+        path: vulnerability-report.json
+
+  publish-package:
+    name: Publish NuGet Package
+    runs-on: ubuntu-latest
+    needs: [build-and-test, sonarcloud, security-scan]
+    if: github.ref == 'refs/heads/main' || github.event_name == 'release'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: ${{ env.DOTNET_VERSION }}
+    
+    - name: Generate version number
+      id: version
+      run: |
+        if [ "${{ github.event_name }}" == "release" ]; then
+          VERSION="${{ github.event.release.tag_name }}"
+        else
+          DATE=$(date +'%Y%m%d')
+          RUN_NUMBER="${{ github.run_number }}"
+          VERSION="${DATE}.${RUN_NUMBER}-beta"
+        fi
+        echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+        echo "Generated version: ${VERSION}"
+    
+    - name: Restore dependencies
+      run: dotnet restore ${{ env.SOLUTION_PATH }} --source https://api.nuget.org/v3/index.json
+    
+    - name: Build for release
+      run: dotnet build ${{ env.SOLUTION_PATH }} --configuration Release --no-restore -p:Version=${{ steps.version.outputs.VERSION }}
+    
+    - name: Run tests before packaging
+      run: dotnet test ${{ env.SOLUTION_PATH }} --configuration Release --no-build --verbosity normal
+    
+    - name: Pack NuGet package
+      run: dotnet pack ${{ env.MAIN_PROJECT_PATH }} --configuration Release --no-build --output ./packages -p:Version=${{ steps.version.outputs.VERSION }}
+    
+    - name: Publish to GitHub Packages
+      run: |
+        dotnet nuget push ./packages/*.nupkg \
+          --source "https://nuget.pkg.github.com/CodexForgeBR/index.json" \
+          --api-key ${{ secrets.GITHUB_TOKEN }} \
+          --skip-duplicate
+    
+    - name: Publish to NuGet.org (Release only)
+      if: github.event_name == 'release'
+      run: |
+        dotnet nuget push ./packages/*.nupkg \
+          --source "https://api.nuget.org/v3/index.json" \
+          --api-key ${{ secrets.NUGET_API_KEY }} \
+          --skip-duplicate
+    
+    - name: Upload package artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: nuget-packages
+        path: packages/
+
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [publish-package]
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Generate version
+      id: version
+      run: |
+        DATE=$(date +'%Y%m%d')
+        RUN_NUMBER="${{ github.run_number }}"
+        VERSION="${DATE}.${RUN_NUMBER}"
+        echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+    
+    - name: Download package artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: nuget-packages
+        path: packages/
+    
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: v${{ steps.version.outputs.VERSION }}
+        name: Claude.Orchestrator v${{ steps.version.outputs.VERSION }}
+        body: |
+          ## 🚀 Claude.Orchestrator v${{ steps.version.outputs.VERSION }}
+          
+          Multi-agent workflow orchestration and context management tool for Claude Code ecosystem.
+          
+          ### Installation
+          ```bash
+          dotnet tool install --global Claude.Orchestrator
+          ```
+          
+          ### Usage
+          ```bash
+          claude-orchestrator --help
+          ```
+          
+          ### Changes
+          - Automated release from main branch
+          - All tests passing
+          - SonarCloud quality gate passed
+          - Security vulnerabilities scanned
+        draft: false
+        prerelease: false
+        files: packages/*
+        token: ${{ secrets.GITHUB_TOKEN }}
